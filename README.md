@@ -1,4 +1,3 @@
-## wickdb
 
 [![Build Status](https://travis-ci.com/Fullstop000/wickdb.svg?branch=master)](https://travis-ci.org/Fullstop000/wickdb)
 [![codecov](https://codecov.io/gh/Fullstop000/wickdb/branch/master/graph/badge.svg)](https://codecov.io/gh/Fullstop000/wickdb)
