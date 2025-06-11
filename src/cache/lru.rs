@@ -1,8 +1,9 @@
 use crate::cache::Cache;
-use crate::util::collection::HashMap;
+use crate::utils::collection::HashMap;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::mem;
+// MaybeUninit 更灵活地处理未初始化的数据,从而避免未定义行为
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,7 +101,7 @@ impl<K, V> LRUInner<K, V> {
     }
 }
 
-impl<K: Hash + Eq, V: Clone> LRUCache<K, V> {
+impl<K: Hash + Eq + Clone, V: Clone> LRUCache<K, V> {
     pub fn new(cap: usize) -> Self {
         let l = LRUInner {
             table: HashMap::default(),
@@ -118,6 +119,54 @@ impl<K: Hash + Eq, V: Clone> LRUCache<K, V> {
             capacity: cap,
             inner: Arc::new(Mutex::new(l)),
             evict_hook: None,
+        }
+    }
+    // K 是数据结构中存储的键的实际类型  Q 是我们用于查询的键的类型  K: Borrow<Q> 的约束确保我们可以使用 Q 类型的引用来查询 K 类型的键
+    pub fn contains_key(&self, key: &K)  -> bool{
+        let key = Key { k: key as *const K };
+        let mut l = self.inner.lock().unwrap();
+        l.table.contains_key(&key)
+    }
+
+    pub fn erase_lru(&self)->Option<(K,V,usize)> {
+        let mut l = self.inner.lock().unwrap();
+        // 找到最少最近使用的元素，即双向链表的尾部元素
+        let prev_key = Key {
+            k: unsafe { (*(*l.tail).prev).key.as_ptr() },
+        };
+
+        // 从哈希表中移除该条目
+        if let Some(mut n) = l.table.remove(&prev_key) {
+            // 减少当前使用量
+            self.usage.fetch_sub(n.charge, Ordering::Relaxed);
+
+            // 如果有驱逐钩子，调用钩子
+            if let Some(hk) = &self.evict_hook {
+                unsafe {
+                    hk(&(*n.key.as_ptr()), &(*n.value.as_ptr()));
+                }
+            }
+            // 释放旧条目的键和值
+            unsafe {
+                ptr::drop_in_place(n.key.as_mut_ptr());
+                ptr::drop_in_place(n.value.as_mut_ptr());
+            }
+            // 从链表中移除
+            l.detach(n.as_mut());
+            return unsafe{Some(((*n.key.as_ptr()).clone(),(*n.value.as_ptr()).clone(),n.charge))};
+        }
+        None
+    }
+    pub fn lookup(&self, key: &K) -> Option<(K, V, usize)> {
+        let k = Key { k: key as *const K };
+        let mut l = self.inner.lock().unwrap();
+        if let Some(node) = l.table.get_mut(&k) {
+            let p = node.as_mut() as *mut LRUEntry<K, V>;
+            l.detach(p);
+            l.attach(p);
+            Some(unsafe { ((*(*p).key.as_ptr()).clone(),(*(*p).value.as_ptr()).clone(),(*p).charge) })
+        } else {
+            None
         }
     }
 }
@@ -176,6 +225,7 @@ impl<K, V> Cache<K, V> for LRUCache<K, V>
                                 ptr::drop_in_place(n.key.as_mut_ptr());
                                 ptr::drop_in_place(n.value.as_mut_ptr());
                             }
+
                             // 将条目的键和值分配为新键和值
                             n.key = MaybeUninit::new(key);
                             n.value = MaybeUninit::new(value);
@@ -447,5 +497,34 @@ mod tests {
         let cache = CacheTest::new(0);
         cache.insert(100, 101);
         assert_eq!(None, cache.get(100));
+    }
+
+    #[test]
+    fn test_erase_lru() {
+        let cache = CacheTest::new(100);
+        cache.insert(100, 101);
+        cache.insert(101, 101);
+        cache.insert(102, 101);
+        cache.insert(103, 101);
+        {
+            let option = cache.cache.erase_lru();
+            println!("{:?}", option);
+        }
+        let option1 = cache.cache.erase_lru();
+        println!("{:?}", option1);
+        assert_eq!(None, cache.get(100));
+        assert_eq!(Some(101), cache.get(102));
+    }
+    #[test]
+    fn test_erase_lru2() {
+        let cache = LRUCache::new(100);
+        let vec1 = vec![1, 2, 3];
+        let vec2 = vec![1, 2, 3];
+        cache.insert(vec1.clone(),123,1);
+        cache.insert(vec2,123,1);
+        let option = cache.erase_lru();
+        // let option = cache.erase_lru();
+        println!("{:?}", option);
+        assert_eq!(None, cache.get(&vec1));
     }
 }

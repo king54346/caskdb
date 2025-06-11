@@ -1,7 +1,7 @@
 use crate::record::{RecordType, BLOCK_SIZE, HEADER_SIZE};
 use crate::storage::File;
-use crate::util::coding::encode_fixed_32;
-use crate::util::crc32;
+use crate::utils::coding::encode_fixed_32;
+use crate::utils::crc32;
 use crate::Result;
 
 /// Writer 将记录写入底层日志“文件”
@@ -129,5 +129,9 @@ impl<F: File> Writer<F> {
         // 更新块偏移量
         self.block_offset += HEADER_SIZE + size;
         Ok(())
+    }
+
+    pub fn offset(&mut self) -> Result<u64> {
+        self.dest.len()
     }
 }

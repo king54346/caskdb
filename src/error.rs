@@ -19,10 +19,10 @@ quick_error! {
         DBClosed(hint: String) {
             display("try to operate a closed db: {}", hint)
         }
-        CompressionFailed(err: snap::Error) {
-            display("compression failed: {}", err)
-            cause(err)
-        }
+        // CompressionFailed(err: snap::Error) {
+        //     display("compression failed: {}", err)
+        //     cause(err)
+        // }
         IO(err: std::io::Error) {
             display("I/O operation error: {}", err)
             cause(err)
@@ -37,6 +37,7 @@ quick_error! {
     }
 }
 
+#[macro_export]
 macro_rules! map_io_res {
     ($result:expr) => {
         match $result {

@@ -1,4 +1,5 @@
 pub mod lru;
+mod arc;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -15,14 +16,15 @@ use std::sync::Arc;
 /// 用户可以自定义实现更复杂的（比如like scan-resistance，a custom eviction policy、variable cache sizing等）
 /// 扫描抗性 防止缓存被一次性的大量扫描操作（如批量读取）所污染
 /// ARC（Adaptive Replacement Cache，自适应替换缓存）
-///
+/// S3-FIFO
 /// 缓存接口 Cache，包括插入、获取、删除和计算总容量的方法
 pub trait Cache<K, V>: Sync + Send
-    where
-        K: Sync + Send,
-        V: Sync + Send + Clone,
+where
+    K: Sync + Send,
+    V: Sync + Send + Clone,
 {
     /// 将键->值的映射插入到缓存中，并根据总缓存容量为其分配指定的charge。
+    /// 如果命中替换kv对，则返回之前的option<v>
     fn insert(&self, key: K, value: V, charge: usize) -> Option<V>;
 
     /// 根据键获取对应的值
@@ -39,10 +41,10 @@ pub trait Cache<K, V>: Sync + Send
 /// 然后在相应的LRUCache中进行查找，这样就大大减少了多线程的访问锁的开销
 /// 使用 PhantomData 来标记泛型类型参数 K 和 V
 pub struct ShardedCache<K, V, C>
-    where
-        C: Cache<K, V>,
-        K: Sync + Send,
-        V: Sync + Send + Clone,
+where
+    C: Cache<K, V>,
+    K: Sync + Send,
+    V: Sync + Send + Clone,
 {
     shards: Arc<Vec<C>>,
     _k: PhantomData<K>,
@@ -50,10 +52,10 @@ pub struct ShardedCache<K, V, C>
 }
 // 分片缓存，每个分片是一个独立的缓存实例，通过哈希函数将键分配到不同的分片上，以减少并发访问的锁开销
 impl<K, V, C> ShardedCache<K, V, C>
-    where
-        C: Cache<K, V>,
-        K: Sync + Send + Hash + Eq,
-        V: Sync + Send + Clone,
+where
+    C: Cache<K, V>,
+    K: Sync + Send + Hash + Eq,
+    V: Sync + Send + Clone,
 {
     /// Create a new `ShardedCache` with given shards
     pub fn new(shards: Vec<C>) -> Self {
@@ -73,10 +75,10 @@ impl<K, V, C> ShardedCache<K, V, C>
 }
 
 impl<K, V, C> Cache<K, V> for ShardedCache<K, V, C>
-    where
-        C: Cache<K, V>,
-        K: Sync + Send + Hash + Eq,
-        V: Sync + Send + Clone,
+where
+    C: Cache<K, V>,
+    K: Sync + Send + Hash + Eq,
+    V: Sync + Send + Clone,
 {
 
     fn insert(&self, key: K, value: V, charge: usize) -> Option<V> {

@@ -34,7 +34,7 @@ pub trait Storage: Send + Sync {
     /// are missing.
     fn mkdir_all<P: AsRef<Path>>(&self, dir: P) -> Result<()>;
 
-    /// Returns a list of the full-path to each file in given directory
+    /// 返回给定目录中每个文件的完整路径列表
     fn list<P: AsRef<Path>>(&self, dir: P) -> Result<Vec<PathBuf>>;
 }
 

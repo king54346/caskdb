@@ -1,16 +1,38 @@
-/// 日志文件内容是一系列 32KB 块。唯一的例外是文件的尾部可能包含部分块pub mod reader;
-pub mod writer;
+///       +-----+-------------+--+----+----------+------+-- ... ----+
+//  File  | r0  |      r1     |P | r2 |    r3    |  r4  |           |
+//        +-----+-------------+--+----+----------+------+-- ... ----+
+//        |<---- BlockSize ----->|<---- BlockSize ----->|
+//   当block无法容纳一个header的时候padding
+//   rn = variable size records
+//   P = Padding
+//   BlockSize = 32KB
+//  Format of a single record:
+// +----------+-------------+-----------+--- ... ---+
+// | CRC (4B) | Length (2B) | Type (1B) |  Payload  |
+// +----------+-------------+-----------+--- ... ---+
+//
+// CRC = 32-bit hash computed over the payload using CRC
+// Length = Length of the payload data
+// Type = Type of record
+//        (FullType, FirstType, MiddleType, LastType)
+//        The type is used to group a bunch of records together to represent
+//        blocks that are larger than BlockSize
+// Payload = Byte stream as long as specified by the payload size
+//  一个file代表一个segment
+
+/// 日志文件内容是一系列 32KB 块。唯一的例外是文件的尾部可能包含部分块
 pub mod reader;
+pub mod writer;
 
 /// The max size of a log block
 pub const BLOCK_SIZE: usize = 32768;
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum RecordType {
-    Zero = 0, // 用于基于 mmap 的存储
-    Full = 1, //表示一个完整的记录
-    First = 2, //表示一个分片记录的第一个片段。这种类型的记录表明数据被拆分，并且这是第一个片段
-    Middle = 3, // 被拆分，中间的一个片段。
+    Zero = 0,   // used for mmap based storage
+    Full = 1,
+    First = 2,
+    Middle = 3,
     Last = 4,
 }
 
@@ -44,8 +66,8 @@ mod tests {
     use crate::record::RecordType::{First, Last, Middle};
     use crate::record::{BLOCK_SIZE, HEADER_SIZE};
     use crate::storage::File;
-    use crate::util::coding::encode_fixed_32;
-    use crate::util::crc32::{hash, mask};
+    use crate::utils::coding::encode_fixed_32;
+    use crate::utils::crc32::{hash, mask};
     use crate::{Error, Result};
     use rand::Rng;
     use std::cell::RefCell;

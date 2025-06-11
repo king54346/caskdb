@@ -1,5 +1,5 @@
 use crate::storage::{File, Storage};
-use crate::{Error, Result};
+use crate::{Error, map_io_res, Result};
 use fs2::FileExt;
 use std::fs::{
     create_dir_all, read_dir, remove_dir, remove_dir_all, remove_file, rename, File as SysFile,
