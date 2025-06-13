@@ -1,5 +1,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
+use crate::{Error, Result};
+use crate::storage::{do_write_string_to_file, File, Storage};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FileType {
@@ -17,48 +19,26 @@ pub enum FileType {
     Temp,
     /// Current active file pointer
     Current,
+    Log
 }
 
 /// Generate filename based on directory, file type and sequence number
 pub fn generate_filename(dirname: &str, filetype: FileType, seq: u64) -> String {
-    let dirname = Path::new(dirname).to_owned();
-    match filetype {
-        FileType::Lock => dirname
-            .join("LOCK")
-            .into_os_string()
-            .into_string()
-            .unwrap(),
-        FileType::Current => dirname
-            .join("CURRENT")
-            .into_os_string()
-            .into_string()
-            .unwrap(),
-        FileType::Temp => dirname
-            .join(format!("{:06}.tmp", seq))
-            .into_os_string()
-            .into_string()
-            .unwrap(),
-        FileType::ActiveData => dirname
-            .join(format!("{:06}.data", seq))
-            .into_os_string()
-            .into_string()
-            .unwrap(),
-        FileType::Data => dirname
-            .join(format!("{:06}.data", seq))
-            .into_os_string()
-            .into_string()
-            .unwrap(),
-        FileType::Hint => dirname
-            .join(format!("{:06}.hint", seq))
-            .into_os_string()
-            .into_string()
-            .unwrap(),
-        FileType::Merge => dirname
-            .join(format!("merge.{:06}", seq))
-            .into_os_string()
-            .into_string()
-            .unwrap(),
-    }
+    let dirname = Path::new(dirname);
+    let filename = match filetype {
+        FileType::Lock => "LOCK",
+        FileType::Log => "LOG",
+        FileType::Current => "CURRENT",
+        FileType::Temp => &format!("{:06}.tmp", seq),
+        FileType::ActiveData => &format!("{:06}.data", seq),
+        FileType::Data => &format!("{:06}.data", seq),
+        FileType::Hint => &format!("{:06}.hint", seq),
+        FileType::Merge => &format!("merge.{:06}", seq),
+    };
+
+    dirname.join(filename)
+        .to_string_lossy()
+        .replace('\\', "/")  // 强制转换为正斜杠
 }
 
 /// Parse filename and return tuple containing file type and sequence number
@@ -66,38 +46,34 @@ pub fn generate_filename(dirname: &str, filetype: FileType, seq: u64) -> String 
 pub fn parse_filename<P: AsRef<Path>>(filename: P) -> Option<(FileType, u64)> {
     let invalid = "invalid";
     let path = filename.as_ref();
-    let file_stem = path.file_stem().unwrap_or_else(|| OsStr::new(invalid));
-
-    match file_stem.to_str() {
+    let file_name = path.file_name().unwrap_or_else(|| OsStr::new(invalid));
+    match file_name.to_str() {
         Some("CURRENT") => Some((FileType::Current, 0)),
         Some("LOCK") => Some((FileType::Lock, 0)),
-        Some(with_seq) => {
+        Some(name) => {
             // Handle merge files (merge.XXXXXX)
-            if with_seq.starts_with("merge") {
-                let parts: Vec<&str> = with_seq.split('.').collect();
-                if parts.len() == 2 {
-                    if let Ok(seq) = parts[1].parse::<u64>() {
-                        return Some((FileType::Merge, seq));
-                    }
-                }
-                return None;
+            if let Some(suffix) = name.strip_prefix("merge.") {
+                return suffix.parse::<u64>()
+                    .ok()
+                    .map(|seq| (FileType::Merge, seq));
             }
 
-            // Handle numbered files
-            if let Ok(seq) = with_seq.parse::<u64>() {
-                match path
-                    .extension()
-                    .unwrap_or_else(|| OsStr::new(invalid))
-                    .to_str()
-                {
-                    Some("data") => Some((FileType::Data, seq)),
-                    Some("hint") => Some((FileType::Hint, seq)),
-                    Some("tmp") => Some((FileType::Temp, seq)),
-                    _ => None,
-                }
-            } else {
-                None
+            // Handle files with extensions (XXXXXX.ext)
+            if let Some((stem, extension)) = name.rsplit_once('.') {
+                let seq = stem.parse::<u64>().ok()?;
+                let file_type = match extension {
+                    "data" => FileType::Data,
+                    "hint" => FileType::Hint,
+                    "tmp" => FileType::Temp,
+                    _ => return None,
+                };
+                return Some((file_type, seq));
             }
+
+            // Handle pure numbered files (XXXXXX)
+            name.parse::<u64>()
+                .ok()
+                .map(|seq| (FileType::Data, seq))
         }
         _ => None,
     }
@@ -112,7 +88,7 @@ pub fn update_current<S: Storage>(env: &S, dir: &str, active_file_num: u64) -> R
     let tmp_path = generate_filename(dir, FileType::Temp, active_file_num);
 
     // Write the active filename to the temporary file
-    let result = do_write_string_to_file(env, &active_filename, &tmp_path, true);
+    let result = do_write_string_to_file(env, active_filename, &tmp_path, true);
 
     // Atomically rename temp file to CURRENT, or clean up on failure
     match &result {
@@ -131,16 +107,28 @@ pub fn update_current<S: Storage>(env: &S, dir: &str, active_file_num: u64) -> R
 /// Read the current active file number from CURRENT file
 pub fn read_current<S: Storage>(env: &S, dir: &str) -> Result<u64> {
     let current_path = generate_filename(dir, FileType::Current, 0);
-    let content = env.read_to_string(&current_path)?;
+    if !env.exists(&current_path) {
+        return Err(Error::Corruption("CURRENT file does not exist".to_string()));
+    }
+    // 定义buffer
+    let mut read_buf = vec![];
+    
+    let current_path = Path::new(&current_path);
+    
+    // buffer
+     
+    
+    env.open(current_path)?.read(&mut read_buf);
+    let content = String::from_utf8(read_buf).unwrap();
     let filename = content.trim();
 
     // Parse the active file number from filename (e.g., "000001.data" -> 1)
     if let Some(dot_pos) = filename.find('.') {
         let number_part = &filename[..dot_pos];
         number_part.parse::<u64>()
-            .map_err(|_| Error::InvalidFormat("Invalid active file number format".to_string()))
+            .map_err(|_| Error::Corruption("Invalid active file number format".to_string()))
     } else {
-        Err(Error::InvalidFormat("Invalid active filename format".to_string()))
+        Err(Error::Corruption("Invalid active filename format".to_string()))
     }
 }
 
@@ -148,7 +136,7 @@ pub fn read_current<S: Storage>(env: &S, dir: &str) -> Result<u64> {
 pub fn get_data_file_numbers<S: Storage>(env: &S, dir: &str) -> Result<Vec<u64>> {
     let mut file_numbers = Vec::new();
 
-    for entry in env.list_dir(dir)? {
+    for entry in env.list(dir)? {
         if let Some((file_type, seq)) = parse_filename(&entry) {
             if matches!(file_type, FileType::Data | FileType::ActiveData) {
                 file_numbers.push(seq);
@@ -162,7 +150,7 @@ pub fn get_data_file_numbers<S: Storage>(env: &S, dir: &str) -> Result<Vec<u64>>
 
 /// Check if a merge operation is in progress
 pub fn is_merge_in_progress<S: Storage>(env: &S, dir: &str) -> bool {
-    for entry in env.list_dir(dir).unwrap_or_default() {
+    for entry in env.list(dir).unwrap_or_default() {
         if let Some((file_type, _)) = parse_filename(&entry) {
             if matches!(file_type, FileType::Merge) {
                 return true;

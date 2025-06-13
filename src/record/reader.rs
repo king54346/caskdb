@@ -235,6 +235,7 @@ impl<F: File> Reader<F> {
                 //清空缓冲区并尝试读取一个块
                 self.clear_buf();
                 if !self.eof {
+                    //  尝试从文件读取数据到缓冲区
                     match self.file.read(&mut self.buf) {
                         Ok(read) => {
                             // 更新缓冲区长度和结束偏移量

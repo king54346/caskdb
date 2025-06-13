@@ -35,6 +35,7 @@ where
 
     /// 返回缓存中存储的所有元素的charge的估计值。
     fn total_charge(&self) -> usize;
+    fn clear(&self);
 }
 
 /// ShardedLRUCache内部有16个LRUCache，查找Key时首先计算key属于哪一个分片，分片的计算方法是取32位hash值的高4位
@@ -98,6 +99,12 @@ where
     // 迭代每个分片的total_charge累加
     fn total_charge(&self) -> usize {
         self.shards.iter().fold(0, |acc, s| acc + s.total_charge())
+    }
+
+    fn clear(&self) {
+        for shard in self.shards.iter() {
+            shard.clear();
+        }
     }
 }
 

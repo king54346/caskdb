@@ -1,5 +1,6 @@
 pub mod file;
 pub mod mem;
+pub mod SegmentedMemStorage;
 
 use crate::{Error, Result};
 use std::io;

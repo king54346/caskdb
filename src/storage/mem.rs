@@ -344,20 +344,20 @@ impl Storage for MemStorage {
 }
 
 #[derive(Clone)]
-enum Node {
+pub enum Node {
     File(FileNode),
     Dir,
 }
 
 impl Node {
-    fn is_file(&self) -> bool {
+    pub fn is_file(&self) -> bool {
         match self {
             Node::File(_) => true,
             Node::Dir => false,
         }
     }
 
-    fn is_dir(&self) -> bool {
+    pub fn is_dir(&self) -> bool {
         match self {
             Node::File(_) => false,
             Node::Dir => true,
@@ -369,22 +369,22 @@ impl Node {
 #[derive(Clone, Default)]
 pub struct FileNode {
     name: String,
-    delay_data_sync: Arc<AtomicBool>,
-    data_sync_error: Arc<AtomicBool>,
-    no_space: Arc<AtomicBool>,
+    pub(crate) delay_data_sync: Arc<AtomicBool>,
+    pub(crate) data_sync_error: Arc<AtomicBool>,
+    pub(crate) no_space: Arc<AtomicBool>,
     // The manifest config has more priority than others if self is a MANIFEST file
-    manifest_sync_error: Arc<AtomicBool>,
-    manifest_write_error: Arc<AtomicBool>,
+    pub(crate) manifest_sync_error: Arc<AtomicBool>,
+    pub(crate) manifest_write_error: Arc<AtomicBool>,
 
-    count_random_reads: Arc<AtomicBool>,
-    random_read_counter: Arc<AtomicUsize>,
+    pub(crate) count_random_reads: Arc<AtomicBool>,
+    pub(crate) random_read_counter: Arc<AtomicUsize>,
 
     inner: Arc<RwLock<InmemFile>>,
 }
 
 impl FileNode {
     #[allow(clippy::field_reassign_with_default)]
-    fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         let mut f = FileNode::default();
         f.name = name.to_owned();
         f

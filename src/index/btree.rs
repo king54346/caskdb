@@ -22,6 +22,7 @@ impl BTreeIndexer {
 
 //  btreeIndexer 支持范围查询功能
 impl Indexer for BTreeIndexer {
+    // 如果key已经存在，则返回旧的KeyDirEntry，否则返回None
     fn put(& self, key: &[u8], position: KeyDirEntry) -> Option<KeyDirEntry> {
         let mut map = self.inner.lock().unwrap();
         map.insert(key.to_vec(), position)

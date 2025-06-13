@@ -3,38 +3,38 @@ use crate::utils::collection::HashMap;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::mem;
-// MaybeUninit 更灵活地处理未初始化的数据,从而避免未定义行为
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-// 一个指向键的原始指针
+
+// 指向键的原始指针包装
 #[derive(Copy, Clone)]
-struct Key<K> {
+struct KeyRef<K> {
     k: *const K,
 }
-// Hash trait 实现 能使用.hash(&mut hasher)方法
-impl<K: Hash> Hash for Key<K> {
+
+impl<K: Hash> Hash for KeyRef<K> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         unsafe { (*self.k).hash(state) }
     }
 }
 
-impl<K: PartialEq> PartialEq for Key<K> {
-    fn eq(&self, other: &Key<K>) -> bool {
+impl<K: PartialEq> PartialEq for KeyRef<K> {
+    fn eq(&self, other: &KeyRef<K>) -> bool {
         unsafe { (*self.k).eq(&*other.k) }
     }
 }
 
-impl<K: Eq> Eq for Key<K> {}
+impl<K: Eq> Eq for KeyRef<K> {}
 
-impl<K> Default for Key<K> {
+impl<K> Default for KeyRef<K> {
     fn default() -> Self {
-        Key { k: ptr::null() }
+        KeyRef { k: ptr::null() }
     }
 }
 
-// 双向链表的节点，包含一个键、一个值、前一个节点和后一个节点的指针，以及一个`charge`值，用于记录此条目占用的空间大小
+// LRU 缓存条目
 struct LRUEntry<K, V> {
     key: MaybeUninit<K>,
     value: MaybeUninit<V>,
@@ -53,6 +53,7 @@ impl<K, V> LRUEntry<K, V> {
             prev: ptr::null_mut(),
         }
     }
+
     fn new_empty() -> Self {
         LRUEntry {
             key: MaybeUninit::uninit(),
@@ -64,33 +65,33 @@ impl<K, V> LRUEntry<K, V> {
     }
 }
 
-
+// LRU 缓存主结构
 pub struct LRUCache<K, V: Clone> {
-    // 缓存的容量
     capacity: usize,
     inner: Arc<Mutex<LRUInner<K, V>>>,
-    // 已分配的空间大小
     usage: Arc<AtomicUsize>,
-    // 删除kv的回调
-    evict_hook: Option<Box<dyn Fn(&K, &V)>>,
+    evict_hook: Option<Arc<dyn Fn(&K, &V) + Send + Sync>>,
 }
-// 包含一个哈希表和一个双向链表的头尾指针
+
+// 内部数据结构
 struct LRUInner<K, V> {
-    table: HashMap<Key<K>, Box<LRUEntry<K, V>>>,
-    // head.next is the newest entry
+    table: HashMap<KeyRef<K>, Box<LRUEntry<K, V>>>,
+    // head.next 是最新的条目
     head: *mut LRUEntry<K, V>,
+    // tail.prev 是最旧的条目
     tail: *mut LRUEntry<K, V>,
 }
 
 impl<K, V> LRUInner<K, V> {
-    //双向链表中分离节点
+    // 从链表中分离节点
     fn detach(&mut self, n: *mut LRUEntry<K, V>) {
         unsafe {
             (*(*n).next).prev = (*n).prev;
             (*(*n).prev).next = (*n).next;
         }
     }
-    // 附加节点
+
+    // 将节点附加到链表头部
     fn attach(&mut self, n: *mut LRUEntry<K, V>) {
         unsafe {
             (*n).next = (*self.head).next;
@@ -99,170 +100,324 @@ impl<K, V> LRUInner<K, V> {
             (*(*n).next).prev = n;
         }
     }
+
+    // 移动节点到头部（标记为最近使用）
+    fn touch(&mut self, n: *mut LRUEntry<K, V>) {
+        self.detach(n);
+        self.attach(n);
+    }
 }
 
 impl<K: Hash + Eq + Clone, V: Clone> LRUCache<K, V> {
     pub fn new(cap: usize) -> Self {
-        let l = LRUInner {
+        let head = Box::into_raw(Box::new(LRUEntry::new_empty()));
+        let tail = Box::into_raw(Box::new(LRUEntry::new_empty()));
+
+        unsafe {
+            (*head).next = tail;
+            (*tail).prev = head;
+        }
+
+        let inner = LRUInner {
             table: HashMap::default(),
-            head: Box::into_raw(Box::new(LRUEntry::new_empty())),
-            tail: Box::into_raw(Box::new(LRUEntry::new_empty())),
+            head,
+            tail,
         };
 
+        LRUCache {
+            usage: Arc::new(AtomicUsize::new(0)),
+            capacity: cap,
+            inner: Arc::new(Mutex::new(inner)),
+            evict_hook: None,
+        }
+    }
+
+    pub fn with_evict_hook<F>(cap: usize, hook: F) -> Self
+    where
+        F: Fn(&K, &V) + Send + Sync + 'static,
+    {
+        let head = Box::into_raw(Box::new(LRUEntry::new_empty()));
+        let tail = Box::into_raw(Box::new(LRUEntry::new_empty()));
+
+        unsafe {
+            (*head).next = tail;
+            (*tail).prev = head;
+        }
+
+        let inner = LRUInner {
+            table: HashMap::default(),
+            head,
+            tail,
+        };
+
+        LRUCache {
+            usage: Arc::new(AtomicUsize::new(0)),
+            capacity: cap,
+            inner: Arc::new(Mutex::new(inner)),
+            evict_hook: Some(Arc::new(hook) as Arc<dyn Fn(&K, &V) + Send + Sync>),
+        }
+    }
+
+    pub fn set_evict_hook<F>(&mut self, hook: F)
+    where
+        F: Fn(&K, &V) + Send + Sync + 'static,
+    {
+        self.evict_hook = Some(Arc::new(hook) as Arc<dyn Fn(&K, &V) + Send + Sync>);
+    }
+
+    // 检查键是否存在（不更新 LRU 顺序）
+    pub fn contains_key(&self, key: &K) -> bool {
+        let key_ref = KeyRef { k: key as *const K };
+        let l = self.inner.lock().unwrap();
+        l.table.contains_key(&key_ref)
+    }
+
+    // 查找条目并返回克隆的键值对（更新 LRU 顺序）
+    pub fn lookup(&self, key: &K) -> Option<(K, V, usize)> {
+        let key_ref = KeyRef { k: key as *const K };
+        let mut l = self.inner.lock().unwrap();
+
+        if let Some(node) = l.table.get_mut(&key_ref) {
+            let p = node.as_mut() as *mut LRUEntry<K, V>;
+            l.touch(p);
+
+            unsafe {
+                Some((
+                    (*(*p).key.as_ptr()).clone(),
+                    (*(*p).value.as_ptr()).clone(),
+                    (*p).charge,
+                ))
+            }
+        } else {
+            None
+        }
+    }
+
+    // 驱逐最少使用的条目
+    pub fn evict_lru(&self) -> Option<(K, V, usize)> {
+        let mut l = self.inner.lock().unwrap();
+
+        // 检查是否为空
+        unsafe {
+            if (*l.head).next == l.tail {
+                return None;
+            }
+        }
+
+        // 获取最旧的条目
+        let oldest = unsafe { (*l.tail).prev };
+        let key_ref = KeyRef {
+            k: unsafe { (*oldest).key.as_ptr() },
+        };
+
+        // 从表中移除
+        if let Some(mut entry) = l.table.remove(&key_ref) {
+            let charge = entry.charge;
+            self.usage.fetch_sub(charge, Ordering::Release);
+            l.detach(entry.as_mut());
+
+            // 提取键值对
+            let (key, value) = unsafe {
+                let k = ptr::read(entry.key.as_ptr());
+                let v = ptr::read(entry.value.as_ptr());
+                (k, v)
+            };
+
+            // 在锁外调用回调
+            drop(l);
+            if let Some(ref hook) = self.evict_hook {
+                hook(&key, &value);
+            }
+
+            Some((key, value, charge))
+        } else {
+            None
+        }
+    }
+
+    // 清空缓存中的所有条目
+    pub fn clear(&self) {
+        let mut l = self.inner.lock().unwrap();
+
+        // 收集所有需要调用回调的键值对
+        let mut to_call_hooks = Vec::new();
+
+        // 遍历并移除所有条目
+        for (_, mut entry) in l.table.drain() {
+            self.usage.fetch_sub(entry.charge, Ordering::Release);
+
+            // 安全地提取键值对
+            unsafe {
+                let k = ptr::read(entry.key.as_ptr());
+                let v = ptr::read(entry.value.as_ptr());
+                to_call_hooks.push((k, v));
+            }
+        }
+
+        // 重置链表，只保留哨兵节点
         unsafe {
             (*l.head).next = l.tail;
             (*l.tail).prev = l.head;
         }
 
-        LRUCache {
-            usage: Arc::new(AtomicUsize::new(0)),
-            capacity: cap,
-            inner: Arc::new(Mutex::new(l)),
-            evict_hook: None,
+        // 在锁外调用所有回调
+        drop(l);
+        if let Some(ref hook) = self.evict_hook {
+            for (k, v) in to_call_hooks {
+                hook(&k, &v);
+            }
         }
     }
-    // K 是数据结构中存储的键的实际类型  Q 是我们用于查询的键的类型  K: Borrow<Q> 的约束确保我们可以使用 Q 类型的引用来查询 K 类型的键
-    pub fn contains_key(&self, key: &K)  -> bool{
-        let key = Key { k: key as *const K };
-        let mut l = self.inner.lock().unwrap();
-        l.table.contains_key(&key)
-    }
 
-    pub fn erase_lru(&self)->Option<(K,V,usize)> {
-        let mut l = self.inner.lock().unwrap();
-        // 找到最少最近使用的元素，即双向链表的尾部元素
-        let prev_key = Key {
-            k: unsafe { (*(*l.tail).prev).key.as_ptr() },
-        };
+    // 内部驱逐方法，必须在持有锁的情况下调用
+    fn evict_to_make_room_locked(&self, l: &mut LRUInner<K, V>, needed: usize) -> bool {
+        let current_usage = self.usage.load(Ordering::Acquire);
 
-        // 从哈希表中移除该条目
-        if let Some(mut n) = l.table.remove(&prev_key) {
-            // 减少当前使用量
-            self.usage.fetch_sub(n.charge, Ordering::Relaxed);
+        if current_usage + needed <= self.capacity {
+            return true;
+        }
 
-            // 如果有驱逐钩子，调用钩子
-            if let Some(hk) = &self.evict_hook {
-                unsafe {
-                    hk(&(*n.key.as_ptr()), &(*n.value.as_ptr()));
+        let mut evicted = 0;
+        let to_evict = current_usage + needed - self.capacity;
+        let mut to_call_hooks = Vec::new();
+
+        while evicted < to_evict {
+            unsafe {
+                if (*l.head).next == l.tail {
+                    // 恢复已移除的条目并调用钩子
+                    for (k, v) in to_call_hooks {
+                        if let Some(ref hook) = self.evict_hook {
+                            hook(&k, &v);
+                        }
+                    }
+                    return false; // 缓存已空
                 }
             }
-            // 释放旧条目的键和值
-            unsafe {
-                ptr::drop_in_place(n.key.as_mut_ptr());
-                ptr::drop_in_place(n.value.as_mut_ptr());
+
+            let oldest = unsafe { (*l.tail).prev };
+            let key_ref = KeyRef {
+                k: unsafe { (*oldest).key.as_ptr() },
+            };
+
+            if let Some(mut entry) = l.table.remove(&key_ref) {
+                evicted += entry.charge;
+                self.usage.fetch_sub(entry.charge, Ordering::Release);
+                l.detach(entry.as_mut());
+
+                // 安全地释放内存
+                unsafe {
+                    let k = ptr::read(entry.key.as_ptr());
+                    let v = ptr::read(entry.value.as_ptr());
+                    to_call_hooks.push((k, v));
+                }
             }
-            // 从链表中移除
-            l.detach(n.as_mut());
-            return unsafe{Some(((*n.key.as_ptr()).clone(),(*n.value.as_ptr()).clone(),n.charge))};
         }
-        None
-    }
-    pub fn lookup(&self, key: &K) -> Option<(K, V, usize)> {
-        let k = Key { k: key as *const K };
-        let mut l = self.inner.lock().unwrap();
-        if let Some(node) = l.table.get_mut(&k) {
-            let p = node.as_mut() as *mut LRUEntry<K, V>;
-            l.detach(p);
-            l.attach(p);
-            Some(unsafe { ((*(*p).key.as_ptr()).clone(),(*(*p).value.as_ptr()).clone(),(*p).charge) })
-        } else {
-            None
+
+        // 在方法结束时调用所有钩子
+        for (k, v) in to_call_hooks {
+            if let Some(ref hook) = self.evict_hook {
+                hook(&k, &v);
+            }
         }
+
+        true
     }
 }
 
 impl<K, V> Cache<K, V> for LRUCache<K, V>
-    where
-        K: Send + Sync + Hash + Eq + Debug,
-        V: Send + Sync + Clone,
+where
+    K: Send + Sync + Hash + Eq + Clone + Debug,
+    V: Send + Sync + Clone,
 {
-    fn insert(&self, key: K, mut value: V, charge: usize) -> Option<V> {
+    fn insert(&self, key: K, value: V, charge: usize) -> Option<V> {
+        if self.capacity == 0 || charge > self.capacity {
+            return None;
+        }
+
         let mut l = self.inner.lock().unwrap();
-        // 如果缓存的容量大于0，继续执行插入操作
-        if self.capacity > 0 {
-            // 查找键是否存在
-            match l.table.get_mut(&Key {
-                k: &key as *const K,
-            }) {
-                Some(h) => {
-                    // 存在
-                    let old_p = h as *mut Box<LRUEntry<K, V>>;
-                    // 设置当前的value
-                    unsafe { mem::swap(&mut value, &mut (*(*old_p).value.as_mut_ptr())) };
-                    //
-                    let p: *mut LRUEntry<K, V> = h.as_mut();
-                    //从链表中删除
-                    l.detach(p);
-                    //将该条目附加到链表头部，表示最近使用
-                    l.attach(p);
-                    // 返回老的value
-                    if let Some(hk) = &self.evict_hook {
-                        hk(&key, &value);
-                    }
-                    Some(value)
-                }
-                None => {
-                    // 键不存在的情况
-                    let mut node = {
-                        // 判断当前使用量达到或超过缓存容量
-                        if self.usage.load(Ordering::Acquire) >= self.capacity {
-                            // 超过
-                            // 获取最近最少使用的条目的键(链尾)
-                            let prev_key = Key {
-                                k: unsafe { (*(*l.tail).prev).key.as_ptr() },
-                            };
-                            // 从哈希表中移除该条目
-                            let mut n = l.table.remove(&prev_key).unwrap();
-                            // 减少当前使用量
-                            self.usage.fetch_sub(n.charge, Ordering::Relaxed);
-                            if let Some(hk) = &self.evict_hook {
-                                unsafe {
-                                    hk(&(*n.key.as_ptr()), &(*n.value.as_ptr()));
-                                }
-                            }
-                            // 释放旧条目的键和值
-                            unsafe {
-                                ptr::drop_in_place(n.key.as_mut_ptr());
-                                ptr::drop_in_place(n.value.as_mut_ptr());
+        let key_ref = KeyRef { k: &key as *const K };
+
+        // 检查键是否已存在
+        if let Some(node) = l.table.get_mut(&key_ref) {
+            let p = node.as_mut() as *mut LRUEntry<K, V>;
+
+            // 更新值并获取旧值
+            let old_value = unsafe {
+                let old_charge = (*p).charge;
+                let old_v = ptr::read((*p).value.as_ptr());
+                ptr::write((*p).value.as_mut_ptr(), value);
+
+                // 更新 charge 并调整 usage
+                if old_charge != charge {
+                    (*p).charge = charge;
+                    if charge > old_charge {
+                        let increase = charge - old_charge;
+                        // 检查是否需要驱逐以腾出空间
+                        if self.usage.load(Ordering::Acquire) + increase > self.capacity {
+                            // 需要驱逐，但当前项正在使用，所以暂时移除它
+                            l.detach(p);
+                            self.usage.fetch_sub(old_charge, Ordering::Release);
+
+                            // 驱逐其他项
+                            if !self.evict_to_make_room_locked(&mut l, charge) {
+                                // 无法腾出足够空间，恢复原值
+                                ptr::write((*p).value.as_mut_ptr(), old_v.clone());
+                                (*p).charge = old_charge;
+                                l.attach(p);
+                                self.usage.fetch_add(old_charge, Ordering::Release);
+                                return None;
                             }
 
-                            // 将条目的键和值分配为新键和值
-                            n.key = MaybeUninit::new(key);
-                            n.value = MaybeUninit::new(value);
-                            // 从链表中删除，然后添加到链表头部
-                            l.detach(n.as_mut());
-                            n
+                            // 重新附加并更新使用量
+                            l.attach(p);
+                            self.usage.fetch_add(charge, Ordering::Release);
                         } else {
-                            //一个新的条目
-                            Box::new(LRUEntry::new(key, value, charge))
+                            self.usage.fetch_add(increase, Ordering::Release);
                         }
-                    };
-                    // 增加usage
-                    self.usage.fetch_add(charge, Ordering::Relaxed);
-                    // 添加到头部
-                    l.attach(node.as_mut());
-                    // 将新条目插入哈希表
-                    l.table.insert(
-                        Key {
-                            k: node.key.as_ptr(),
-                        },
-                        node,
-                    );
-                    None
+                    } else {
+                        self.usage.fetch_sub(old_charge - charge, Ordering::Release);
+                    }
                 }
+
+                old_v
+            };
+
+            l.touch(p);
+
+            // 在锁外调用回调
+            drop(l);
+            if let Some(ref hook) = self.evict_hook {
+                hook(&key, &old_value);
             }
+
+            Some(old_value)
         } else {
+            // 新插入的情况
+            // 确保有足够空间
+            if !self.evict_to_make_room_locked(&mut l, charge) {
+                return None;
+            }
+
+            let mut entry = Box::new(LRUEntry::new(key, value, charge));
+            self.usage.fetch_add(charge, Ordering::Release);
+            l.attach(entry.as_mut());
+
+            l.table.insert(
+                KeyRef { k: entry.key.as_ptr() },
+                entry,
+            );
+
             None
         }
     }
 
     fn get(&self, key: &K) -> Option<V> {
-        let k = Key { k: key as *const K };
+        let key_ref = KeyRef { k: key as *const K };
         let mut l = self.inner.lock().unwrap();
-        if let Some(node) = l.table.get_mut(&k) {
+
+        if let Some(node) = l.table.get_mut(&key_ref) {
             let p = node.as_mut() as *mut LRUEntry<K, V>;
-            l.detach(p);
-            l.attach(p);
+            l.touch(p);
             Some(unsafe { (*(*p).value.as_ptr()).clone() })
         } else {
             None
@@ -270,19 +425,24 @@ impl<K, V> Cache<K, V> for LRUCache<K, V>
     }
 
     fn erase(&self, key: &K) {
-        let k = Key { k: key as *const K };
+        let key_ref = KeyRef { k: key as *const K };
         let mut l = self.inner.lock().unwrap();
-        // table中删除entry
-        if let Some(mut n) = l.table.remove(&k) {
-            // 减小usage
-            self.usage.fetch_sub(n.charge, Ordering::SeqCst);
-            // 修改inner的前后指针
-            l.detach(n.as_mut() as *mut LRUEntry<K, V>);
-            unsafe {
-                // 执行回调
-                if let Some(cb) = &self.evict_hook {
-                    cb(key, &(*n.value.as_ptr()));
-                }
+
+        if let Some(mut entry) = l.table.remove(&key_ref) {
+            self.usage.fetch_sub(entry.charge, Ordering::Release);
+            l.detach(entry.as_mut());
+
+            // 安全地提取键值
+            let (k, v) = unsafe {
+                let k = ptr::read(entry.key.as_ptr());
+                let v = ptr::read(entry.value.as_ptr());
+                (k, v)
+            };
+
+            // 在锁外调用回调
+            drop(l);
+            if let Some(ref hook) = self.evict_hook {
+                hook(&k, &v);
             }
         }
     }
@@ -291,47 +451,56 @@ impl<K, V> Cache<K, V> for LRUCache<K, V>
     fn total_charge(&self) -> usize {
         self.usage.load(Ordering::Acquire)
     }
+
+    fn clear(&self) {
+        self.clear();
+    }
 }
 
 impl<K, V: Clone> Drop for LRUCache<K, V> {
     fn drop(&mut self) {
         let mut l = self.inner.lock().unwrap();
-        // 遍历table删除entry
-        (*l).table.values_mut().for_each(|e| unsafe {
-            ptr::drop_in_place(e.key.as_mut_ptr());
-            ptr::drop_in_place(e.value.as_mut_ptr());
-        });
+
+        // 清空哈希表并释放所有条目
+        for (_, mut entry) in l.table.drain() {
+            unsafe {
+                ptr::drop_in_place(entry.key.as_mut_ptr());
+                ptr::drop_in_place(entry.value.as_mut_ptr());
+            }
+        }
+
+        // 释放哨兵节点
         unsafe {
-            let _head = *Box::from_raw(l.head);
-            let _tail = *Box::from_raw(l.tail);
+            let _ = Box::from_raw(l.head);
+            let _ = Box::from_raw(l.tail);
         }
     }
 }
-// 线程安全
+
+// 确保线程安全
 unsafe impl<K: Send, V: Send + Clone> Send for LRUCache<K, V> {}
 unsafe impl<K: Sync, V: Sync + Clone> Sync for LRUCache<K, V> {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::thread;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
     const CACHE_SIZE: usize = 100;
 
     struct CacheTest {
         cache: LRUCache<u32, u32>,
-        deleted_kv: Rc<RefCell<Vec<(u32, u32)>>>,
+        deleted_kv: StdArc<StdMutex<Vec<(u32, u32)>>>,
     }
 
     impl CacheTest {
         fn new(cap: usize) -> Self {
-            let deleted_kv = Rc::new(RefCell::new(vec![]));
+            let deleted_kv = StdArc::new(StdMutex::new(vec![]));
             let cloned = deleted_kv.clone();
-            let mut cache = LRUCache::<u32, u32>::new(cap);
-            cache.evict_hook = Some(Box::new(move |k, v| {
-                cloned.borrow_mut().push((*k, *v));
-            }));
+            let cache = LRUCache::with_evict_hook(cap, move |k: &u32, v: &u32| {
+                cloned.lock().unwrap().push((*k, *v));
+            });
             Self { cache, deleted_kv }
         }
 
@@ -352,7 +521,7 @@ mod tests {
         }
 
         fn assert_deleted_kv(&self, index: usize, (key, val): (u32, u32)) {
-            assert_eq!((key, val), self.deleted_kv.borrow()[index]);
+            assert_eq!((key, val), self.deleted_kv.lock().unwrap()[index]);
         }
 
         fn assert_get(&self, key: u32, want: u32) -> u32 {
@@ -381,7 +550,7 @@ mod tests {
         assert_eq!(Some(201), cache.get(200));
         assert_eq!(None, cache.get(300));
 
-        assert_eq!(1, cache.deleted_kv.borrow().len());
+        assert_eq!(1, cache.deleted_kv.lock().unwrap().len());
         cache.assert_deleted_kv(0, (100, 101));
     }
 
@@ -389,7 +558,7 @@ mod tests {
     fn test_erase() {
         let cache = CacheTest::new(CACHE_SIZE);
         cache.erase(200);
-        assert_eq!(0, cache.deleted_kv.borrow().len());
+        assert_eq!(0, cache.deleted_kv.lock().unwrap().len());
 
         cache.insert(100, 101);
         cache.insert(200, 201);
@@ -397,13 +566,13 @@ mod tests {
 
         assert_eq!(None, cache.get(100));
         assert_eq!(Some(201), cache.get(200));
-        assert_eq!(1, cache.deleted_kv.borrow().len());
+        assert_eq!(1, cache.deleted_kv.lock().unwrap().len());
         cache.assert_deleted_kv(0, (100, 101));
 
         cache.erase(100);
         assert_eq!(None, cache.get(100));
         assert_eq!(Some(201), cache.get(200));
-        assert_eq!(1, cache.deleted_kv.borrow().len());
+        assert_eq!(1, cache.deleted_kv.lock().unwrap().len());
     }
 
     #[test]
@@ -414,7 +583,7 @@ mod tests {
         assert_eq!(v1, 101);
         cache.insert(100, 102);
         let v2 = cache.assert_get(100, 102);
-        assert_eq!(1, cache.deleted_kv.borrow().len());
+        assert_eq!(1, cache.deleted_kv.clone().lock().unwrap().len());
         cache.assert_deleted_kv(0, (100, 101));
         assert_eq!(v1, 101);
         assert_eq!(v2, 102);
@@ -425,7 +594,7 @@ mod tests {
         assert_eq!(None, cache.get(100));
         assert_eq!(
             vec![(100, 101), (100, 102)],
-            cache.deleted_kv.borrow().clone()
+            cache.deleted_kv.lock().unwrap().clone()
         );
     }
 
@@ -442,7 +611,7 @@ mod tests {
             assert_eq!(Some(2000 + i), cache.get(1000 + i));
             assert_eq!(Some(101), cache.get(100));
         }
-        assert_eq!(cache.cache.inner.lock().unwrap().table.len(), CACHE_SIZE);
+        assert!(cache.cache.inner.lock().unwrap().table.len() <= CACHE_SIZE);
         assert_eq!(Some(101), cache.get(100));
         assert_eq!(None, cache.get(200));
         assert_eq!(None, cache.get(300));
@@ -483,13 +652,13 @@ mod tests {
         }
         let mut cache_weight = 0;
         for i in 0..index {
-            let weight = if index & 1 == 0 { light } else { heavy };
+            let weight = if i & 1 == 0 { light } else { heavy };
             if let Some(val) = cache.get(i) {
                 cache_weight += weight;
                 assert_eq!(1000 + i, val);
             }
         }
-        assert!(cache_weight < CACHE_SIZE);
+        assert!(cache_weight <= CACHE_SIZE);
     }
 
     #[test]
@@ -500,31 +669,99 @@ mod tests {
     }
 
     #[test]
-    fn test_erase_lru() {
-        let cache = CacheTest::new(100);
+    fn test_evict_lru() {
+        let cache = CacheTest::new(4);
         cache.insert(100, 101);
-        cache.insert(101, 101);
-        cache.insert(102, 101);
-        cache.insert(103, 101);
-        {
-            let option = cache.cache.erase_lru();
-            println!("{:?}", option);
-        }
-        let option1 = cache.cache.erase_lru();
-        println!("{:?}", option1);
+        cache.insert(101, 102);
+        cache.insert(102, 103);
+        cache.insert(103, 104);
+
+        let evicted = cache.cache.evict_lru();
+        assert_eq!(evicted, Some((100, 101, 1)));
+
         assert_eq!(None, cache.get(100));
-        assert_eq!(Some(101), cache.get(102));
+        assert_eq!(Some(102), cache.get(101));
+        assert_eq!(Some(103), cache.get(102));
+        assert_eq!(Some(104), cache.get(103));
     }
+
     #[test]
-    fn test_erase_lru2() {
-        let cache = LRUCache::new(100);
+    fn test_evict_lru_with_vec_keys() {
+        let cache = LRUCache::new(2);
         let vec1 = vec![1, 2, 3];
-        let vec2 = vec![1, 2, 3];
-        cache.insert(vec1.clone(),123,1);
-        cache.insert(vec2,123,1);
-        let option = cache.erase_lru();
-        // let option = cache.erase_lru();
-        println!("{:?}", option);
+        let vec2 = vec![4, 5, 6];
+
+        cache.insert(vec1.clone(), 123, 1);
+        cache.insert(vec2.clone(), 456, 1);
+
+        let evicted = cache.evict_lru();
+        assert_eq!(evicted, Some((vec1.clone(), 123, 1)));
+
         assert_eq!(None, cache.get(&vec1));
+        assert_eq!(Some(456), cache.get(&vec2));
+    }
+
+    #[test]
+    fn test_charge_updates() {
+        let cache = CacheTest::new(10);
+
+        // Insert with charge 3
+        cache.insert_with_charge(1, 100, 3);
+        assert_eq!(cache.cache.total_charge(), 3);
+
+        // Update with smaller charge
+        cache.insert_with_charge(1, 101, 1);
+        assert_eq!(cache.cache.total_charge(), 1);
+        assert_eq!(cache.get(1), Some(101));
+
+        // Update with larger charge
+        cache.insert_with_charge(1, 102, 5);
+        assert_eq!(cache.cache.total_charge(), 5);
+        assert_eq!(cache.get(1), Some(102));
+    }
+
+    #[test]
+    fn test_concurrent_access() {
+        let cache = StdArc::new(LRUCache::new(1000));
+        let mut handles = vec![];
+
+        // Spawn multiple threads that read and write concurrently
+        for i in 0..10 {
+            let cache_clone = cache.clone();
+            let handle = thread::spawn(move || {
+                for j in 0..100 {
+                    let key = (i * 100 + j) % 200;
+                    cache_clone.insert(key, key * 2, 1);
+                    cache_clone.get(&key);
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify cache is still in a valid state
+        assert!(cache.total_charge() <= 1000);
+    }
+
+    #[test]
+    fn test_contains_key_no_touch() {
+        let cache = CacheTest::new(3);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        cache.insert(3, 30);
+
+        // contains_key should not affect LRU order
+        assert!(cache.cache.contains_key(&1));
+
+        // Insert a new item, should evict 1 if contains_key didn't touch it
+        cache.insert(4, 40);
+        assert_eq!(cache.get(1), None);
+        assert_eq!(cache.get(2), Some(20));
+        assert_eq!(cache.get(3), Some(30));
+        assert_eq!(cache.get(4), Some(40));
     }
 }

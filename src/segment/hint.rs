@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::record::reader::Reader;
 use crate::record::writer::Writer;
 use crate::storage::{File, Storage};
-
+use crate::store::filename::parse_filename;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct HintEntry {
@@ -44,13 +44,13 @@ impl <S: Storage<F=F> + Clone,F:File> HintFile<S,F> {
     // 加载hint文件
     pub(crate) fn new(path: &Path,storage: &S) -> Self {
         // File name must starts with valid file id.
-        // let file_id = parse_file_id(path).expect("file id not found in file path");、
+        let file_id = parse_filename(path).expect("file id not found in file path");
         // 获取文件id，通过store中的filename
         match storage.open(path) {
             Ok(f) => {
                 Self {
                     path: PathBuf::from(path),
-                    id: 0,
+                    id: file_id.1,
                     writer: Some(Writer::new(f)),
                     storage: storage.clone(),
                 }

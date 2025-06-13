@@ -131,14 +131,13 @@ impl<S: Storage<F=F> + Clone,F:File> DataFile<S,F> {
     /// 它从文件路径中解析数据id，其中包含一个可选的
     /// writer（仅适用于可写段文件）和reader。
     pub(crate) fn new(path: &Path,storage: &S, writeable: bool) -> Self {
-        // let file_id = parse_file_id(path).expect("file id not found in file path");
-        // todo 获取segment的文件id
+        let file_id = parse_filename(path).expect("file id not found in file path");
         match storage.open(path) {
             Ok(f) => {
                 let w =if writeable{Some(Writer::new(f))}else { None };
                 Self {
                     path: PathBuf::from(path),
-                    id: 0,
+                    id: file_id.1,
                     writer: w,
                     options: Arc::new(Options::default()),
                     size: 0,
